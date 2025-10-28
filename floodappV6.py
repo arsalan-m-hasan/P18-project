@@ -9,40 +9,10 @@ from rasterio.warp import transform
 from shapely.geometry import Point
 import folium
 from streamlit_folium import st_folium
+from math import radians, sin, cos, sqrt, atan2  
+from typing import Optional, Dict
 
 
-
-# def estimate_return_period_from_ifd(rain_mm: float, duration_h: float, lat: float, lon: float, ifd_df: pd.DataFrame) -> float:
-#     """
-#     Estimate rainfall return period (in years) based on the IFD table for the nearest grid/station.
-#     """
-#     try:
-#         intensity = rain_mm / duration_h
-#         duration_min = duration_h * 60
-
-#         idx = ((ifd_df['lat'] - lat)**2 + (ifd_df['lon'] - lon)**2).idxmin()
-#         site_ifd = ifd_df.loc[ifd_df['station_id'] == ifd_df.loc[idx, 'station_id']]
-
-#         site_ifd['Duration in min'] = site_ifd['Duration in min'].astype(float)
-#         row = site_ifd.iloc[(site_ifd['Duration in min'] - duration_min).abs().argsort()[:1]]
-
-#         aep_cols = ['63.20%', '50%', '20%', '10%', '5%', '2%', '1%']
-#         return_periods = [1, 2, 5, 10, 20, 50, 100]
-#         aep_values = row[aep_cols].values.flatten().astype(float)
-
-#         if intensity < aep_values.min():
-#             return 1.0
-#         if intensity > aep_values.max():
-#             return 100.0
-
-#         rp = np.interp(intensity, aep_values, return_periods)
-#         return float(round(rp, 1))
-
-#     except Exception as e:
-#         print(f"⚠️ IFD estimation error: {e}")
-#         return np.nan
-# -----------------------------
-# PATHS (edit if your tree differs)
 # -----------------------------
 PROPERTY_GPKG   = "SwinburneData/Property/Properties.gpkg"
 FLOODMAP_ROOT   = "SwinburneData/FloodMaps/FrankstonSouth"
@@ -51,41 +21,246 @@ SUBCATCHMENT_GPKG = "SwinburneData/Subcatchments/Subcatchments.gpkg"
 subcatchments_gdf = gpd.read_file(SUBCATCHMENT_GPKG)
 subcatchments_gdf = subcatchments_gdf.to_crs(epsg=4326)
 
-# --- Clean column names once when reading the CSV ---
-ifd_table = pd.read_csv("SwinburneData/IFD/ifd_table.csv")
-ifd_table.columns = ifd_table.columns.str.strip().str.lower().str.replace(' ', '_')
-print(ifd_table.columns.tolist())
+CANON_AEP_COLS = ['63.20%', '50%', '20%', '10%', '5%', '2%', '1%']
+CANON_ARI = np.array([1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0], dtype=float)
+
+def _haversine_km(lat1, lon1, lat2, lon2):
+    """Return distance in km between two points."""
+    R = 6371.0
+    lat1, lon1, lat2, lon2 = map(radians, (lat1, lon1, lat2, lon2))
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = sin(dlat/2.0)**2 + cos(lat1) * cos(lat2) * sin(dlon/2.0)**2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    return R * c
 
 
-
-
-def estimate_return_period_from_ifd(rain_mm: float, duration_h: float, lat: float, lon: float, ifd_df: pd.DataFrame) -> float:
+def _map_aep_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Estimate rainfall return period (years) using IFD data.
+    Try to find/rename AEP columns in df to canonical names in CANON_AEP_COLS.
+    Works with variations like '63.2%', '63_20', '63.20', '63_2', 'p63.2' etc.
+    """
+    cols = list(df.columns)
+    lowcols = [c.lower() for c in cols]
+
+    mapping = {}
+    # patterns for each canonical key (ordered to prefer more specific matches)
+    patterns = {
+        '63.20%': ['63.20', '63.2', '63_20', '63_2', '63'],
+        '50%': ['50'],
+        '20%': ['20'],
+        '10%': ['10'],
+        '5%': ['5'],
+        '2%': ['2'],
+        '1%': ['1']
+    }
+
+    used = set()
+    for canon, pats in patterns.items():
+        found = None
+        for pat in pats:
+            # match substring excluding common words like 'station' etc.
+            for orig, low in zip(cols, lowcols):
+                if orig in used:
+                    continue
+                if pat in low and ('%' in orig or pat in low.split('_') or pat in low):
+                    found = orig
+                    break
+            if found:
+                break
+        # fallback: try any column that contains the number as substring
+        if not found:
+            for orig, low in zip(cols, lowcols):
+                if orig in used:
+                    continue
+                if any(ch.isdigit() for ch in pat):
+                    if pat in low:
+                        found = orig
+                        break
+        if found:
+            mapping[found] = canon
+            used.add(found)
+
+    # Final verification: require all canonical columns present
+    mapped_values = list(mapping.values())
+    missing = [c for c in CANON_AEP_COLS if c not in mapped_values]
+    if missing:
+        # Try case where csv already has canonical names present
+        available = [c for c in cols if c in CANON_AEP_COLS]
+        for c in available:
+            if c not in mapped_values:
+                mapping[c] = c
+        mapped_values = list(mapping.values())
+        missing = [c for c in CANON_AEP_COLS if c not in mapped_values]
+
+    if missing:
+        raise ValueError(f"Could not auto-detect AEP columns for: {missing}. Columns found: {cols}")
+
+    # rename safely (only those mapped)
+    df = df.copy()
+    df.rename(columns=mapping, inplace=True)
+    return df
+
+
+def load_ifd_data(filepath: str) -> pd.DataFrame:
+    """
+    Load IFD CSV and normalise column names and AEP columns to CANON_AEP_COLS.
+    Expected minimal columns after cleaning: station_id, lat, lon, duration_in_min, (AEP columns)
+    """
+    df = pd.read_csv(filepath)
+    # basic normalisation for column keys similar to your app
+    df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_').str.replace('-', '_')
+    # attempt to rename & standardise AEP columns
+    df = _map_aep_columns(df)
+    # ensure required columns exist
+    req = ['station_id', 'lat', 'lon', 'duration_in_min']
+    missing = [c for c in req if c not in df.columns]
+    if missing:
+        raise ValueError(f"IFD CSV missing required columns: {missing}")
+    # force numeric
+    df['duration_in_min'] = pd.to_numeric(df['duration_in_min'], errors='coerce')
+    for col in CANON_AEP_COLS:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    # drop invalid rows
+    df = df.dropna(subset=['station_id', 'lat', 'lon', 'duration_in_min'])
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+
+def classify_ari_label(ari: float) -> str:
+    """Return nearest canonical label for given ari (years)."""
+    if ari is None or np.isnan(ari):
+        return "unknown"
+    bins = np.array([1, 2, 5, 10, 20, 50, 100], dtype=float)
+    idx = int(np.argmin(np.abs(np.log(bins) - np.log(max(ari, 1e-9)))))
+    return f"1-in-{int(bins[idx])}-year"
+
+
+def estimate_return_period_from_ifd(
+    rain_mm: float,
+    duration_h: float,
+    lat: float,
+    lon: float,
+    ifd_df: pd.DataFrame,
+    climate_uplift: bool = False,
+    uplift_factor: float = 0.10,
+    max_distance_km: float = 200.0
+) -> Optional[float]:
+    """
+    Estimate return period (years) from observed rainfall using IFD table.
+
+    Args:
+        rain_mm: observed total rainfall (mm)
+        duration_h: duration in hours
+        lat, lon: location
+        ifd_df: pre-loaded IFD DataFrame (use load_ifd_data to prepare)
+        climate_uplift: if True, apply multiplicative uplift (e.g., +10%)
+        uplift_factor: fraction (0.10 = +10%)
+        max_distance_km: if no station within this, function will still attempt closest but will warn
+
+    Returns:
+        float return period in years (e.g., 10.0), or np.nan on failure
     """
     try:
-        intensity = rain_mm / duration_h
-        duration_min = duration_h * 60
+        # Validate inputs
+        if rain_mm is None or duration_h is None:
+            return np.nan
+        if duration_h <= 0:
+            return np.nan
+        # apply uplift
+        eff_rain = float(rain_mm) * (1.0 + float(uplift_factor)) if climate_uplift else float(rain_mm)
+        intensity = eff_rain / float(duration_h)  # mm per hour
+        duration_min = float(duration_h) * 60.0
 
-        # Find nearest station
-        idx = ((ifd_df['lat'] - lat)**2 + (ifd_df['lon'] - lon)**2).idxmin()
-        site_ifd = ifd_df.loc[ifd_df['station_id'] == ifd_df.loc[idx, 'station_id']].copy()
+        # ensure ifd_df has required AEP columns
+        for col in CANON_AEP_COLS:
+            if col not in ifd_df.columns:
+                raise ValueError(f"IFD table missing AEP column: {col}")
 
-        site_ifd['duration_in_min'] = site_ifd['duration_in_min'].astype(float)
-        row = site_ifd.iloc[(site_ifd['duration_in_min'] - duration_min).abs().argsort()[:1]]
-        
-        
-        aep_cols = ['63.20%', '50%', '20%', '10%', '5%', '2%', '1%']
+        # --- find nearest station (vectorized) ---
+        # compute haversine distances vectorized
+        lat_arr = ifd_df['lat'].astype(float).to_numpy()
+        lon_arr = ifd_df['lon'].astype(float).to_numpy()
+        lat_rad = np.radians(lat_arr)
+        lon_rad = np.radians(lon_arr)
+        lat0 = np.radians(lat)
+        lon0 = np.radians(lon)
+        dlat = lat_rad - lat0
+        dlon = lon_rad - lon0
+        a = np.sin(dlat/2.0)**2 + np.cos(lat0) * np.cos(lat_rad) * np.sin(dlon/2.0)**2
+        dist_km = 2.0 * 6371.0 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
+        nearest_idx = int(np.nanargmin(dist_km))
+        min_dist = float(dist_km[nearest_idx])
 
-        return_periods = [1, 2, 5, 10, 20, 50, 100]
-        aep_values = row[aep_cols].values.flatten().astype(float)
+        # optional: if beyond max_distance_km, still return closest but could warn (app can log)
+        if min_dist > max_distance_km:
+            # still proceed but caller may want to know
+            pass
 
-        rp = np.interp(intensity, aep_values, return_periods)
-        return float(round(rp, 1))
+        station_id = ifd_df['station_id'].iloc[nearest_idx]
+        station_rows = ifd_df[ifd_df['station_id'] == station_id].copy()
+        station_rows = station_rows.sort_values('duration_in_min').reset_index(drop=True)
 
-    except Exception as e:
-        print(f"⚠️ IFD estimation error: {e}")
+        durations = station_rows['duration_in_min'].astype(float).to_numpy()  # minutes
+        if np.any(durations <= 0):
+            raise ValueError("IFD durations must be positive")
+
+        # build AEP depth matrix for the station (shape: n_durations x 7)
+        aep_matrix = station_rows[CANON_AEP_COLS].to_numpy(dtype=float)
+
+        # --- interpolate to requested duration (in log-duration space) ---
+        # if exact match (allow small tolerance)
+        tol = 1e-6
+        match_idxs = np.where(np.isclose(durations, duration_min, atol=tol))[0]
+        if match_idxs.size > 0:
+            aep_values = aep_matrix[match_idxs[0], :]
+        else:
+            # We will interpolate for each AEP column across durations using log(duration)
+            log_durs = np.log(durations)
+            log_target = np.log(duration_min)
+            aep_values = np.zeros(len(CANON_AEP_COLS), dtype=float)
+            for j in range(len(CANON_AEP_COLS)):
+                y = aep_matrix[:, j]
+                valid = ~np.isnan(y) & (y > 0)
+                if np.sum(valid) == 0:
+                    aep_values[j] = np.nan
+                elif np.sum(valid) == 1:
+                    aep_values[j] = y[valid][0]
+                else:
+                    # interpolate in log-duration space (linear interp)
+                    aep_values[j] = float(np.interp(log_target, log_durs[valid], y[valid]))
+
+        # remove invalid AEP entries
+        valid_mask = (~np.isnan(aep_values)) & (aep_values > 0)
+        if not np.any(valid_mask):
+            return np.nan
+
+        x = aep_values[valid_mask]      # depths (mm) at canonical AEPs
+        y = CANON_ARI[valid_mask]       # corresponding ARI values (years)
+
+        # --- estimate ARI by log-log interpolation/extrapolation ---
+        # if intensity below min depth -> near 1-year
+        if intensity <= np.min(x):
+            estimated_ari = float(y[np.argmin(x)])  # usually 1
+        elif intensity >= np.max(x):
+            # extrapolate on log-log using last two valid points
+            log_x = np.log(x)
+            log_y = np.log(y)
+            # np.interp will extrapolate; use that
+            log_est = np.interp(np.log(intensity), log_x, log_y)
+            estimated_ari = float(np.exp(log_est))
+        else:
+            log_est = np.interp(np.log(intensity), np.log(x), np.log(y))
+            estimated_ari = float(np.exp(log_est))
+
+        # bounds & sanity
+        estimated_ari = float(np.clip(estimated_ari, 0.5, 1000.0))
+        return estimated_ari
+
+    except Exception as exc:
+        # return nan on failure; caller can log exc
         return np.nan
+
 
 # Load raster catalog dynamically
 raster_catalog = pd.read_csv("SwinburneData/FloodMaps/raster_catalog.csv")
@@ -641,4 +816,5 @@ st.download_button(
     "flood_metrics.csv",
     "text/csv"
 )
+
 
