@@ -11,11 +11,12 @@ import folium
 from streamlit_folium import st_folium
 from math import radians, sin, cos, sqrt, atan2  
 from typing import Optional, Dict
+from rapidfuzz import process, fuzz
 
 
 # -----------------------------
 PROPERTY_GPKG   = "SwinburneData/Property/Properties.gpkg"
-FLOODMAP_ROOT   = "SwinburneData/FloodMaps/FrankstonSouth"
+FLOODMAP_ROOT   = "SwinburneData/FloodMaps/Flood Maps"
 
 SUBCATCHMENT_GPKG = "SwinburneData/Subcatchments/Subcatchments.gpkg"
 subcatchments_gdf = gpd.read_file(SUBCATCHMENT_GPKG)
@@ -265,6 +266,9 @@ def estimate_return_period_from_ifd(
 # Load raster catalog dynamically
 raster_catalog = pd.read_csv("SwinburneData/FloodMaps/raster_catalog.csv")
 
+# Load IFD table pathway
+IFD_TABLE_PATH = "SwinburneData/IFD/ifd_table.csv"
+ifd_table = load_ifd_data(IFD_TABLE_PATH)
 # --- Normalise catalog after reading it ---
 def normalise_catalog(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -392,10 +396,47 @@ def clarification_needed(rain, dur, coords, addr_hint):
 # -----------------------------
 # Property locator (no recursion, EPSG:7855 native)
 # -----------------------------
+STREET_EQUIV = {
+    "ST": "STREET", "ST.": "STREET",
+    "RD": "ROAD",   "RD.": "ROAD",
+    "CT": "COURT",  "CT.": "COURT",
+    "AVE": "AVENUE","AV": "AVENUE",
+    "PL": "PLACE",
+    "CR": "CRESCENT", "CRES": "CRESCENT"
+}
+
+def normalize_street(s: str) -> str:
+    s = s.upper().strip()
+    for abbr, full in STREET_EQUIV.items():
+        s = re.sub(rf"\b{abbr}\b", full, s)
+    return s
+
+def parse_address_parts(addr: str):
+    addr = addr.strip().upper()
+    parts = re.split(r"[ ,]+", addr)
+
+    house_no = None
+    street   = None
+    suburb   = None
+
+    for p in parts:
+        if re.fullmatch(r"\d+[A-Z]?", p):
+            house_no = p
+            break
+
+    if len(parts) >= 2:
+        suburb = " ".join(parts[-2:]) if len(parts[-1]) < 4 else parts[-1]
+
+    street_parts = [p for p in parts if p not in (house_no, suburb)]
+    if street_parts:
+        street = " ".join(street_parts)
+
+    return house_no, street, suburb
+
 def best_property(addr_hint: str | None, latlon: tuple[float, float] | None):
     gdf = props_gdf
 
-    # --- 1. Coordinate-based search (works fine as-is)
+    # --- 1. Coordinate-based search
     if latlon:
         lat, lon = latlon
         pt = gpd.GeoSeries([Point(lon, lat)], crs="EPSG:4326").to_crs(gdf.crs).iloc[0]
@@ -413,48 +454,64 @@ def best_property(addr_hint: str | None, latlon: tuple[float, float] | None):
             "prop_idx": int(row.name),
         }
 
-    # --- 2. Address-text-based search
+    # --- 2. Fuzzy address-based search
     if addr_hint:
-        # Normalize hint
-        hint = addr_hint.upper().strip()
+        addr_hint_norm = normalize_street(addr_hint)
 
-        # Split into parts (street name, house number, suburb)
-        parts = re.split(r"[ ,]+", hint)
-        num = None
-        for p in parts:
-            if re.fullmatch(r"\d+[A-Z]?", p):
-                num = p
-                break
+        house_no, street, suburb = parse_address_parts(addr_hint_norm)
+        street = normalize_street(street or "")
+        suburb = suburb.upper() if suburb else ""
 
-        # Find suburb match
-        suburb_candidates = gdf[gdf["Suburb"].astype(str).str.upper().str.contains("FRANKSTON", na=False)]
-        # Use entire GDF if suburb missing
-        candidates = suburb_candidates if not suburb_candidates.empty else gdf
+        candidates = gdf.copy()
+        candidates["StreetNorm"] = candidates["Street"].astype(str).apply(normalize_street)
 
-        # Street match
-        for word in parts:
-            matches = candidates[candidates["Street"].astype(str).str.upper().str.contains(word, na=False)]
-            if not matches.empty:
-                candidates = matches
-                break
+        if suburb:
+            sub_match = process.extractOne(
+                suburb,
+                candidates["Suburb"].astype(str).unique(),
+                scorer=fuzz.partial_ratio
+            )
+            if sub_match and sub_match[1] > 60:
+                candidates = candidates[candidates["Suburb"].str.upper() == sub_match[0].upper()]
 
-        # House match
-        if num:
-            candidates = candidates[candidates["House"].astype(str).str.upper() == num]
+        if street:
+            street_matches = process.extract(
+                street,
+                candidates["StreetNorm"].unique(),
+                scorer=fuzz.partial_ratio,
+                limit=10
+            )
+            if street_matches:
+                best_streets = [s for s, score, _ in street_matches if score > 60]
+                candidates = candidates[candidates["StreetNorm"].isin(best_streets)]
 
-        # Return closest centroid match if multiple
-        if not candidates.empty:
-            row = candidates.iloc[0]
-            cen_wgs = gpd.GeoSeries([row.geometry.centroid], crs=gdf.crs).to_crs(4326).iloc[0]
-            return {
-                "match_type": "address",
-                "Full_Address": row.get("Full_Address"),
-                "Suburb": row.get("Suburb"),
-                "Postcode": row.get("Postcode"),
-                "lat": cen_wgs.y,
-                "lon": cen_wgs.x,
-                "prop_idx": int(row.name),
-            }
+        if house_no:
+            candidates = candidates[
+                candidates["House"].astype(str).str.contains(house_no, na=False)
+            ]
+
+        if candidates.empty:
+            return None
+
+        candidates["score"] = candidates["Full_Address"].apply(
+            lambda a: fuzz.token_set_ratio(a.upper(), addr_hint_norm.upper()) / 100.0
+        )
+        best_row = candidates.sort_values("score", ascending=False).iloc[0]
+
+        if best_row["score"] < 0.45:
+            return None
+
+        cen_wgs = gpd.GeoSeries([best_row.geometry.centroid], crs=gdf.crs).to_crs(4326).iloc[0]
+
+        return {
+            "match_type": "address (fuzzy component match)",
+            "Full_Address": best_row.get("Full_Address"),
+            "Suburb": best_row.get("Suburb"),
+            "Postcode": best_row.get("Postcode"),
+            "lat": cen_wgs.y,
+            "lon": cen_wgs.x,
+            "prop_idx": int(best_row.name),
+        }
 
     return None
 
@@ -679,16 +736,54 @@ with st.container():
             dur = st.number_input("Duration (hours)", value=dur if dur else 1.0, min_value=0.0, step=0.25)
         with col3:
             mode = st.radio("Location input", ["Address hint","Coordinates"], index=0 if not coords else 1, horizontal=True)
-        if mode=="Coordinates":
-            lat = st.number_input("Latitude (e.g., -38.15)", value=coords[0] if coords else -38.1539, step=0.0001, format="%.6f")
-            lon = st.number_input("Longitude (e.g., 145.10)", value=coords[1] if coords else 145.1038, step=0.0001, format="%.6f")
+        if mode == "Coordinates":
+            lat = st.number_input(
+                "Latitude (e.g., -38.15)",
+                value=coords[0] if coords else -38.1539,
+                step=0.0001,
+                format="%.6f"
+            )
+
+            lon = st.number_input(
+                "Longitude (e.g., 145.10)",
+                value=coords[1] if coords else 145.1038,
+                step=0.0001,
+                format="%.6f"
+            )
+
             coords = (lat, lon)
             addr_hint = None
-        else:
-            addr_hint = st.text_input("Address / Street / Suburb", value=addr_hint or "Frankston South")
-            coords = None
 
-    st.divider()
+        else:
+            st.markdown("**Enter address details**")
+
+            col_a, col_b, col_c = st.columns([1, 2, 2])
+
+        with col_a:
+            house_input = st.text_input(
+                "🏠 Unit / House number",
+                placeholder="e.g. 24"
+            )
+
+        with col_b:
+            street_input = st.text_input(
+                "🛣️ Street name",
+                placeholder="e.g. Dell Road"
+            )
+
+        with col_c:
+            suburb_input = st.text_input(
+                "🏙️ Suburb",
+                placeholder="e.g. Frankston South"
+            )
+
+            addr_hint = " ".join(
+                [x.strip() for x in [house_input, street_input, suburb_input] if x]
+            ).strip()
+
+        coords = None
+
+        st.divider()
 
 # -----------------------------
 # Property resolution
